@@ -1,0 +1,249 @@
+/###################################################################
+#任务目标   ：通过定时器产生任务切换，其中swi来实现多个任务之间切换
+#实验平台    : 本实验是基于S3C2440上实现
+/####################################################################
+#工作原理 ：
+  在运行任务程序的时候通过定时器产生中断，进入任务优先级调度，选择优先级最高的任务去执行；其中各个任务之间通过SWI软中断来实现相互切换。
+难点：在中断模式和SVC模式下任务栈信息保存及恢复，同时在SVC模式下把将要运行的任务栈信息从该任务栈里恢复到寄存器中，最后跳转到用户态执行任务。
+基本流程：
+
+![图片.png](http://upload-images.jianshu.io/upload_images/5939484-70f6b9b6ea0b354b.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+
+#实现步骤：
+请参考微内核之任务切换。http://www.jianshu.com/p/7792cdc4fd5f
+
+#增加与修改部分bug：
+主要增加定时器中断以及任务函数寄存器信息完整保存，使每次任务执行时被中断后能正确恢复该任务的信息，各个任务被中断还能从中断点继续执行。
+###1、IRQ模式下任务栈信息保存
+
+
+    
+*IRQ模式中断处理函数
+
+```
+/*#####################################################
+ * IRQ中断被监测到，则下面行为被执行:
+ * R14_irq = 将被执行的下一条指令地址+4;
+ * SPSR_irq = CPSR
+ * CPSR[4:0] = 0b10010 ； Enter Supervisor mode 
+ * CPSR[5] = 0         ； Execute in ARM state 
+ * CPSR[6] is unchanged 
+ * CPSR[7] = 1         ；Disable normal interrupts 
+ * CPSR[8] = 1         ; Disable Imprecise Data Aborts (v6 only)
+ * CPSR[9] = CP15_reg1_EEbit ； Endianness on exception entry 
+ * 执行irq处理函数后返回原程序，可以使用如下指令:
+ * SUBS PC,R14,#4 ; SPSR_irq中的值自动存储到CPSR中
+#######################################################*/    
+HandleIRQ:
+
+   SUB LR, LR, #4                             /*  计算返回地址,中断模式LR保存被中断指令的下一条指令 */
+  
+    STMDB   SP!,    { LR }                    /*  被中断模式下的指令下一条指令 */
+    STMDB   SP!,    { R0-R14}^                /* ^表示保存user模式下R0-R14，只针对usr模式 */ 
+                     
+    LDR  R0,=IRQ_STACK			/* 保存irq模式下的SP栈，用于切换到SVC模式下*/
+	STR SP, [R0]	    				/*  恢复保存的寄存器值,用于调试  */
+
+	LDR R0, =LR_VAR 			        /*  保存IRQ模式下的LR，用于调试  */
+	STR R14, [R0]	
+
+	LDR	R0, =pCurTcb		       /* 获取当前任务栈的起始地址 */
+	LDR	R2, [R0]		
+	MRS R0, SPSR			   
+	STR R0,[R2],#4			/* SPSR存进当前任务栈里 */
+	STR R0,[R2],#4			/* CPSR存进当前任务栈里 */ 
+
+	MOV R1, SP
+	MOV	R3,#16				/* 把IRQ模式下保存寄存器数量R0-R14 */	
+ 
+/*  把IRQ模式下保存寄存器数量R0-R15复制到当前任务栈里  */
+
+IRQ_STACK_COPY: 			
+
+	LDR	R0,[R1],#4		
+	STR	R0,[R2],#4		
+	SUBS R3,R3,#1		
+	BNE	IRQ_STACK_COPY						
+        
+    LDR LR, =int_return             /* 设置调用ISR即EINT_Handle函数后的返回地址 
+    LDR PC, =ISR_Handle             /* 调用中断服务函数，在interrupt.c中 */
+
+int_return:
+   LDMIA   SP!,    { R0-R14 }^     /* ^表示把中断模式下SP栈里寄存器恢复到usr模式下对应的寄存器中 */
+   LDMIA   SP!,    { PC }^         /* 中断返回, ^表示将spsr的值复制到cpsr */
+```
+
+
+
+###2、SVC模式下任务栈信息保存
+
+*SVC模式中断处理函数
+```
+/******************************************************************************
+ * SWI中断进入到SVC(超级用户模式)，当SWI被执行时，下面行为被执行:
+ * R14_svc = SWI指令的下一条指令;
+ * SPSR_svc = CPSR
+ * CPSR[4:0] = 0b10011 ； Enter Supervisor mode 
+ * CPSR[5] = 0         ； Execute in ARM state 
+ * CPSR[6] is unchanged 
+ * CPSR[7] = 1         ；Disable normal interrupts 
+ * CPSR[8] is unchanged 
+ * CPSR[9] = CP15_reg1_EEbit ； Endianness on exception entry 
+ * 执行SWI函数后返回原程序，可以使用如下指令:
+ * MOVS PC,R14 ; SPSR_svc中的值自动存储到CPSR中
+ ******************************************************************************/
+
+HandleSWI:
+
+    STMDB   sp!,    {R14}   		/* svc模式下R14(LR)保存user模式下的下一条指令地址PC; */
+	LDR R0, =LR_VAR 				/* 保存SVC模式下的LR，用于调试 */
+	STR R14, [R0]
+	
+    STMDB   sp!,    { r0-r14}^      /* ^表示user模式下的R0-R14到SVC模式的SP中，只针对user模式 */					
+
+	MRS     R0, SPSR        		/* 不同模式之间切换，cpsr被保存在SPSR中 */	
+    STMDB   sp!, {R0} 				/* CPSR位置 */	
+	STMDB   sp!, {R0} 				/* SPSR位置 */	
+
+
+	LDR R0, =SVC_STACK              /* 保存SVC模式下的SP栈，用于恢复和调试 */
+	STR sp, [R0]
+
+
+	/******************************************************************************
+	* 下面代码用于监测irq中断触发的SWI中断，以便跳转到taskSched函数执行最高优先级任务
+	******************************************************************************/
+
+	sub  R0, R14, #4                 /* lr -4 为指令SWI XXX的地址,低24位是软件中断号 */
+	nop
+	ldr  R1,[R0,#0]                  /* lr -4 为指令SWI XXX的地址,低24位是软件中断号 */
+	nop
+	bic  R1,R1,#0XFF000000           /* 取得arm指令的低24位立即数 */
+	cmp  R1,#255		             /* 判断24位立即数，如果是255，调用timer0_taskSched函数 */
+	beq  timer0_taskSched
+
+	/******************************************************************************
+	* 把寄存器值保存到当前任务栈里，把SVC模式下保存的当前任务栈信息保存到当前任务栈
+	* tasknTcb中。以备下次调用时在恢复该任务的栈信息,是否可以直接存在栈里呢?
+	******************************************************************************/
+
+	LDR   R0, =pCurTcb            /* 获取当前任务栈的起始地址 */
+	LDR   R1, [R0] 
+
+	CMP   R1,#0						/* 把pCurTcb值==0；说明是taskStart函数；跳转到taskBefore处执行 */
+	BEQ   taskBefore
+	
+	LDR   R0,=SVC_STACK				/* 恢复异常时保存SVC模式下的SP栈指针到R2 */
+	LDR   R2,[R0] 
+	
+	MOV   R3,#18  	                /* 把SVC模式下栈信息保存到当前任务栈地址，保存SPSR/CPSR/R0-R14寄存器 */    
+STACK_COPY: 
+	LDR   R0,[R2],#4 
+	STR   R0,[R1],#4 
+	SUBS  R3,R3,#1 
+	BNE   STACK_COPY 
+	
+taskBefore:
+
+    sub lr, lr, #4                  /* lr -4 为指令SWI XXX的地址,低24位是软件中断号 */
+	ldr R3,[lr,#0]                  /* lr -4 为指令SWI XXX的地址,低24位是软件中断号 */
+	bic R3,R3,#0XFF000000           /* 取得arm指令的低24位立即数 */
+	
+	cmp R3,#0		                /* 判断24位立即数，如果是0，调用usrModeSpSetup函数 */
+	beq  usrModeSpSetup
+
+	cmp R3,#1		                /* 判断24位立即数，如果是1，调用task1Tcb函数 */
+	ldr R0,=task1Tcb
+	ldr R0,[R0]
+	beq  taskTcbSwitch
+
+	cmp R3,#2		                /* 判断24位立即数，如果是2，调用task2Tcb函数 */
+	ldr R0,=task2Tcb
+	ldr R0,[R0]
+	beq  taskTcbSwitch
+
+	cmp R3,#3		                /* 判断24位立即数，如果是3，调用task3Tcb函数 */
+	ldr R0,=task3Tcb
+	ldr R0,[R0]
+	beq  taskTcbSwitch
+
+	bne  END 
+taskTcbSwitch:
+	ldr pc, =taskSwitch
+
+/******************************************************************************
+* 建立用户模式栈空间
+******************************************************************************/
+usrModeSpSetup:
+	mrs R0, CPSR   		            /* Read the CPSR */
+	bic R0, R0, #0xdF    	        /* Clear the mode irq fiq bits  */
+	orr R0, R0, #0x10    	        /* Set the mode bits to FIQ mode */
+	msr cpsr_c, R0   		        /* 进入用户态，并设置用户态的SP,使能中断 */
+	ldr sp, =0x33e00000             /* 设置用户栈指针起始值 */
+	ldr R0, =USER_STACK 				/* 保存IRQ模式下的LR，用于调试 */
+	str sp, [R0]
+
+	ldr pc, =rootTask	            /* rootTask开始用户模式 */
+
+timer0_taskSched:
+	ldr pc, =taskSched	            /* 在SVC模式下进入taskSched函数调度函数 */
+            
+END:
+	
+ 	movne R0, #-1                   /* 没有该软中断对应函数，出错返回-1 */
+
+
+```
+###3、任务切换函数taskswitch修改       
+
+```
+
+/***********************************************************************************
+函数功能: 实现任务切换，调用新得任务执行，并把控制权交给新任务.
+入口参数: pTcb: 即将运行的任务的TCB指针.
+返 回 值: none.
+***********************************************************************************/
+
+
+int taskSwitch(TCB * pTcb)
+{
+
+    /****************************************************************************** 
+    * 即将运行任务的寄存器组地址, 汇编语言通过这个变量恢复寄存器 
+    ******************************************************************************/
+    nextTaskSp = &pTcb->strStackReg;
+
+    /* 即将运行任务的TCB指针 */
+    pCurTcb = pTcb;
+	__asm__(
+
+    /******************************************************************************
+    * 获取将要运行任务的栈信息并运行新任务
+    ******************************************************************************/
+	" LDR    R0, =nextTaskSp \n\t"
+    " LDR    R1, [R0] \n\t"
+
+	" LDMIA  R1!, {R0} \n\t"	  /* Spsr位置 */
+	" MSR	 SPSR, R0  \n\t"
+	" LDMIA  R1!, {R0} \n\t"      /* cpsr位置 */
+
+	" MOV  R13, R1 \n\t"		  /* 开始恢复原用户态任务栈信息 */
+
+	" LDMIA  R13!, {R0-R12}^ \n\t"  /* ^表示把任务栈里R0-R14恢复到user模式下的R0-R14中，只针对用户模式哦 */
+	" ADD R13,R13,#0x4 \n\t" 		/* 跳过恢复用户态的R13  */
+	
+	" LDMIA  R13!, {R14}^ \n\t"	    /* ^表示把任务栈里R0-R14恢复到user模式下的R0-R14中，只针对用户模式哦 */
+
+	" nop \n\t"
+	" LDMIA  R13!, {R14} \n\t"      /* ^表示把任务栈里R15恢复到SVC模式下的R14中，只针对用户模式哦 */
+	" nop \n\t"
+
+	" LDR R13, =SVC_STACK \n\t" 	/* 保存SVC模式下的SP栈，用于恢复和调试 */	
+	" LDR R13, [R13] \n\t"	
+	" ADD R13,R13,#0x48 \n\t" 		/* 恢复SVC模式下的SP栈;这里可以释放掉SVC模式SP栈，因为要跳到用户模式 */
+
+	" MOVS   R15,  R14 \n\t"		/* 进入用户模式, SVC模式下的SPSR值恢复到USR模式下的CPSR中 */
+ 
+);
+	return 0;
+}
